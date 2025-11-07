@@ -10,7 +10,7 @@ import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 try:
     import msgpack  # type: ignore
@@ -154,27 +154,21 @@ def apply_secondary_xor(payload: bytes, key: Optional[int]) -> bytes:
     return bytes(b ^ key for b in payload)
 
 
-def candidate_keys(slot: Optional[int], brute_force: bool) -> Iterator[Optional[int]]:
-    seen = set()
+def candidate_keys(slot: Optional[int]) -> Tuple[List[Optional[int]], List[int]]:
+    """Return initial keys and brute-force candidates without duplicates."""
+
+    initial: List[Optional[int]] = []
+    seen: Set[Optional[int]] = set()
     if slot is not None:
         key = slot % 256
         if key not in seen:
-            LOGGER.info("Trying slot-derived secondary XOR key: %d", key)
+            initial.append(key)
             seen.add(key)
-            yield key
-    # Always try no secondary XOR before brute forcing.
     if None not in seen:
+        initial.append(None)
         seen.add(None)
-        LOGGER.info("Trying without secondary XOR key")
-        yield None
-    if brute_force or slot is None:
-        LOGGER.info("Starting brute-force search of secondary XOR keys")
-        for key in range(1, 256):
-            if key in seen:
-                continue
-            seen.add(key)
-            LOGGER.debug("Brute-forcing key %d", key)
-            yield key
+    brute_force = [key for key in range(1, 256) if key not in seen]
+    return initial, brute_force
 
 
 def attempt_decompressions(payload: bytes, debug: bool, dry_run: bool) -> Iterator[Tuple[str, bytes]]:
@@ -324,12 +318,15 @@ def decode_file(path: Path, out_path: Path, slot: Optional[int], brute_force: bo
     header, payload = extract_header(decrypted)
     LOGGER.info("Header captured (%d bytes)", len(header))
     trimmed = trim_payload(payload)
-    candidate_key_iter = list(candidate_keys(slot, brute_force))
-    if not candidate_key_iter:
+    initial_keys, brute_force_keys = candidate_keys(slot)
+    if not initial_keys and not brute_force_keys:
         raise DecodeError("No secondary XOR keys available for testing")
 
     last_error: Optional[Exception] = None
-    for key in candidate_key_iter:
+
+    def try_key(key: Optional[int], message: str) -> Optional[DecodeResult]:
+        nonlocal last_error
+        LOGGER.info(message)
         decrypted_payload = apply_secondary_xor(trimmed, key)
         key_label = "none" if key is None else f"{key:03d}"
         write_debug(
@@ -345,7 +342,12 @@ def decode_file(path: Path, out_path: Path, slot: Optional[int], brute_force: bo
                 merged = merge_dicts(dicts)
             except Exception as exc:
                 last_error = exc
-                LOGGER.debug("MessagePack parsing failed for key %s (%s): %s", key, compression, exc)
+                LOGGER.debug(
+                    "MessagePack parsing failed for key %s (%s): %s",
+                    key,
+                    compression,
+                    exc,
+                )
                 continue
             LOGGER.info(
                 "Decoded successfully using key=%s compression=%s", key, compression
@@ -380,6 +382,54 @@ def decode_file(path: Path, out_path: Path, slot: Optional[int], brute_force: bo
                 payload_decrypted=unpack_buffer,
                 raw_dict=merged,
             )
+        return None
+
+    tried_keys: Set[Optional[int]] = set()
+    best_result: Optional[DecodeResult] = None
+    initial_messages: Dict[Optional[int], str] = {}
+    for key in initial_keys:
+        if key is None:
+            initial_messages[key] = "Trying without secondary XOR key"
+        elif slot is not None and key == slot % 256:
+            initial_messages[key] = f"Trying slot-derived secondary XOR key: {key}"
+        else:
+            initial_messages[key] = f"Trying secondary XOR key: {key}"
+
+    for key in initial_keys:
+        if key in tried_keys:
+            continue
+        tried_keys.add(key)
+        result = try_key(key, initial_messages.get(key, f"Trying secondary XOR key: {key}"))
+        if result is not None:
+            if not brute_force:
+                return result
+            if best_result is None:
+                best_result = result
+
+    should_bruteforce = bool(brute_force_keys) and (best_result is None or brute_force)
+    if should_bruteforce:
+        LOGGER.info(
+            "Falling back to brute-force search of secondary XOR keys%s",
+            " (forced)" if brute_force else "",
+        )
+    if should_bruteforce and not brute_force:
+        LOGGER.debug("--bruteforce not set; proceeding with fallback brute-force search")
+
+    if should_bruteforce:
+        for key in brute_force_keys:
+            if key in tried_keys:
+                continue
+            tried_keys.add(key)
+            LOGGER.debug("Brute-forcing key %d", key)
+            result = try_key(key, f"Trying secondary XOR key: {key}")
+            if result is not None:
+                if not brute_force:
+                    return result
+                if best_result is None:
+                    best_result = result
+
+    if best_result is not None:
+        return best_result
     raise DecodeError(
         "Failed to decode payload. Last error: %s" % (last_error or "Unknown"),
     )
